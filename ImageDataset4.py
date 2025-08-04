@@ -133,6 +133,7 @@ class ImageDatasetAGIQA(Dataset):
         self.mos3 = []
         self.all_names = []
         self.con_text_prompts = []
+        self.dataset = ''
         
         # Read CSV file using pandas
         df = pd.read_csv(csv_file)
@@ -153,17 +154,20 @@ class ImageDatasetAGIQA(Dataset):
                 self.mos1.append(row['mos_quality'])
                 self.mos2.append(0.0)  # No aesthetic score in AGIQA-3K
                 self.mos3.append(row['mos_align'])
+                self.dataset = 'AGIQA-3K'
             elif 'mos_quality' in df.columns and 'mos_correspondence' in df.columns and 'mos_authenticity' in df.columns:
                 # AIGCIQA2023 format: mos_quality, mos_correspondence, mos_authenticity  
                 self.mos1.append(row['mos_quality'])
                 self.mos2.append(row['mos_authenticity'])  # mos_a
                 self.mos3.append(row['mos_correspondence'])  # mos_c
+                self.dataset = 'AIGCIQA2023'
             elif 'mos' in df.columns:
                 # AIGCQA-20k format: single mos column
                 mos_value = row['mos']
                 self.mos1.append(mos_value)  # Use single MOS for quality
                 self.mos2.append(0.0)  # No aesthetic score
                 self.mos3.append(0.0)  # No correspondence score
+                self.dataset = 'AIGCQA-20k'
             else:
                 raise ValueError(f"Unsupported CSV format. Available columns: {df.columns.tolist()}")
                 
@@ -181,7 +185,10 @@ class ImageDatasetAGIQA(Dataset):
         I_m = self.preprocess[1](I)
         I_s = self.preprocess[2](I)
         con_text_prompts = self.con_text_prompts[index]
-        con_tokens = torch.cat([clip.tokenize(prompt) for prompt in con_text_prompts])
+        if self.dataset == 'AIGCQA-20k':
+            con_tokens = torch.cat([clip.tokenize(prompt, context_length=512) for prompt in con_text_prompts])
+        else:
+            con_tokens = torch.cat([clip.tokenize(prompt) for prompt in con_text_prompts])
         mos_q = self.mos1[index]
         mos_a = self.mos2[index]
         mos_c = self.mos3[index]
