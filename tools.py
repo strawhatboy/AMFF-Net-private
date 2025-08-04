@@ -38,6 +38,34 @@ def set_dataset4(txt_file, bs, data_set, radius, num_workers, preprocess, mtl, t
 
     return loader
 
+def set_dataset_csv(csv_file, bs, data_set, radius, num_workers, preprocess, mtl, test, get_class=False):
+    """
+    Create dataset loader for CSV files
+    """
+    if mtl == 0:
+        is_aigc2023 = True
+    else:
+        is_aigc2023 = False
+    
+    from ImageDataset4 import ImageDatasetAGIQA
+    data = ImageDatasetAGIQA(
+        csv_file=csv_file,
+        img_dir=data_set,
+        mtl=mtl,
+        test=test,
+        is_aigc2013=is_aigc2023,
+        preprocess=preprocess,
+        get_class=get_class)
+
+    if test:
+        shuffle = False
+    else:
+        shuffle = True
+
+    loader = DataLoader(data, batch_size=bs, shuffle=shuffle, pin_memory=True, num_workers=num_workers)
+
+    return loader
+
 class AdaptiveResize(object):
     """Resize the input PIL Image to the given size adaptively.
 

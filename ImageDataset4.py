@@ -116,3 +116,81 @@ class ImageDataset4(Dataset):
     def __len__(self):
         return len(self.img_paths)
 
+
+class ImageDatasetAGIQA(Dataset):    
+    def __init__(self, csv_file, img_dir, mtl, preprocess, test, is_aigc2013=False,
+                 get_loader=get_default_img_loader, get_class=False):
+        """
+        Args:
+            csv_file (string): Path to the csv file with annotations.
+            img_dir (string): Directory of the images.
+            preprocess (callable, optional): transform to be applied on a sample.
+        """
+        self.img_paths = []
+        self.is_aigc2013 = is_aigc2013
+        self.mos1 = []
+        self.mos2 = []
+        self.mos3 = []
+        self.all_names = []
+        self.con_text_prompts = []
+        
+        # Read CSV file using pandas
+        df = pd.read_csv(csv_file)
+        
+        # Process each row based on available columns
+        for idx, row in df.iterrows():
+            # Get image path and prompt (these should be in all datasets)
+            img_path = str(row['name'])
+            prompt = str(row['prompt'])
+            
+            self.img_paths.append(os.path.join(img_dir, img_path))
+            self.all_names.append(os.path.basename(img_path))
+            self.con_text_prompts.append([prompt])
+            
+            # Handle different MOS column structures based on dataset
+            if 'mos_quality' in df.columns and 'mos_align' in df.columns:
+                # AGIQA-3K format: mos_quality, mos_align
+                self.mos1.append(row['mos_quality'])
+                self.mos2.append(0.0)  # No aesthetic score in AGIQA-3K
+                self.mos3.append(row['mos_align'])
+            elif 'mos_quality' in df.columns and 'mos_correspondence' in df.columns and 'mos_authenticity' in df.columns:
+                # AIGCIQA2023 format: mos_quality, mos_correspondence, mos_authenticity  
+                self.mos1.append(row['mos_quality'])
+                self.mos2.append(row['mos_authenticity'])  # mos_a
+                self.mos3.append(row['mos_correspondence'])  # mos_c
+            elif 'mos' in df.columns:
+                # AIGCQA-20k format: single mos column
+                mos_value = row['mos']
+                self.mos1.append(mos_value)  # Use single MOS for quality
+                self.mos2.append(0.0)  # No aesthetic score
+                self.mos3.append(0.0)  # No correspondence score
+            else:
+                raise ValueError(f"Unsupported CSV format. Available columns: {df.columns.tolist()}")
+                
+        self.mtl = mtl
+        self.img_dir = img_dir
+        self.get_class = get_class
+        self.loader = get_loader()
+        self.preprocess = preprocess
+        self.test = test
+
+    def __getitem__(self, index):
+        image_name = self.img_paths[index]
+        I = self.loader(image_name)
+        I_l = self.preprocess[0](I)
+        I_m = self.preprocess[1](I)
+        I_s = self.preprocess[2](I)
+        con_text_prompts = self.con_text_prompts[index]
+        con_tokens = torch.cat([clip.tokenize(prompt) for prompt in con_text_prompts])
+        mos_q = self.mos1[index]
+        mos_a = self.mos2[index]
+        mos_c = self.mos3[index]
+        sample = {'mos_q': mos_q, 'mos_a': mos_a, 'mos_c': mos_c,
+                  'img_l': I_l, 'img_m': I_m, 'img_s': I_s,
+                  'con_tokens': con_tokens, 'img_name': image_name}
+        if self.get_class:
+            sample['class'] = get_class_names(self.all_names[index], self.mtl)
+        return sample
+
+    def __len__(self):
+        return len(self.img_paths)
