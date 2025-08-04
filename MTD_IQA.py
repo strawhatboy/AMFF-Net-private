@@ -37,6 +37,8 @@ parser = argparse.ArgumentParser(description='MTD-IQA Training')
 parser.add_argument('--dataset', type=str, required=True, 
                     choices=['AGIQA3K', 'AIGCIQA2023', 'AIGCQA20K'],
                     help='Dataset to train on: AGIQA3K, AIGCIQA2023, or AIGCQA20K')
+parser.add_argument('--batch_size', type=int, default=16,
+                    help='Batch size for training (default: 16, reduced from 32 for memory optimization)')
 args = parser.parse_args()
 
 # Use the specified dataset
@@ -48,7 +50,7 @@ initial_lr1 = 5e-4
 initial_lr2 = 5e-6
 weight_decay = 0.001
 num_epoch = 100
-bs = 32
+bs = args.batch_size  # Use command line argument
 early_stop = 0
 clip_net = 'RN50'
 in_size = 1024
@@ -99,6 +101,13 @@ def train(model, best_result, best_epoch):
     global early_stop
     print(optimizer.state_dict()['param_groups'][0]['lr'])
 
+    # Memory optimization: clear cache before training
+    torch.cuda.empty_cache()
+    
+    # Gradient accumulation settings
+    accumulation_steps = 2  # Effective batch size will be bs * accumulation_steps
+    last_total_loss = 0.0  # Track last loss for validation print
+
     for idx, sample_batched in enumerate(tqdm(train_loaders)):
 
         x_l, x_m, x_s, mos_q, mos_a, mos_c, con_tokens = sample_batched['img_l'], sample_batched['img_m'], \
@@ -116,40 +125,65 @@ def train(model, best_result, best_epoch):
         mos_c = mos_c.to(torch.float32).to(device)
         con_tokens = con_tokens.to(device)
 
-        optimizer.zero_grad()
-        logits_per_qua, logits_per_con, logits_per_aes = do_batch(x_l, x_m, x_s, con_tokens)
+        # Use autocast for mixed precision training
+        with torch.cuda.amp.autocast():
+            logits_per_qua, logits_per_con, logits_per_aes = do_batch(x_l, x_m, x_s, con_tokens)
 
-        weight_qua = logits_per_qua[:, 0]
-        weight_con = logits_per_con[:, 0]
-        weight_aes = logits_per_aes[:, 0]
-        loss_q = loss_fn(weight_qua, mos_q.detach())
-        loss_c = loss_m3(weight_con, mos_c.detach())
+            weight_qua = logits_per_qua[:, 0]
+            weight_con = logits_per_con[:, 0]
+            weight_aes = logits_per_aes[:, 0]
+            loss_q = loss_fn(weight_qua, mos_q.detach())
+            loss_c = loss_m3(weight_con, mos_c.detach())
 
-        if mtl == 0:  # AGIQA3K - quality + correspondence
-            total_loss = loss_q + loss_c
-        elif mtl == 1:  # AIGCIQA2023 - quality + aesthetic + correspondence
-            loss_a = loss_fn(weight_aes, mos_a.detach())
-            total_loss = loss_q + loss_a + loss_c
-        elif mtl == 2:  # AIGCQA20K - only quality (single MOS)
-            total_loss = loss_q  # Only use quality loss for single MOS dataset
+            if mtl == 0:  # AGIQA3K - quality + correspondence
+                total_loss = loss_q + loss_c
+            elif mtl == 1:  # AIGCIQA2023 - quality + aesthetic + correspondence
+                loss_a = loss_fn(weight_aes, mos_a.detach())
+                total_loss = loss_q + loss_a + loss_c
+            elif mtl == 2:  # AIGCQA20K - only quality (single MOS)
+                total_loss = loss_q  # Only use quality loss for single MOS dataset
+            
+            # Keep track of original loss for logging
+            original_loss = total_loss.item()
+            last_total_loss = original_loss
+            
+            # Scale loss for gradient accumulation
+            total_loss = total_loss / accumulation_steps
 
         if torch.any(torch.isnan(total_loss)):
             print('nan in', idx)
 
-        total_loss.backward()
-        # statistics
-        if not pretrain:
+        # Use gradient scaler for mixed precision
+        scaler.scale(total_loss).backward()
+        
+        # Update weights every accumulation_steps
+        if (idx + 1) % accumulation_steps == 0:
+            convert_models_to_fp32(model)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+        
+        # statistics - only log when we actually update weights
+        if not pretrain and (idx + 1) % accumulation_steps == 0:
             global global_step
-            logger.add_scalar(tag='total_loss', scalar_value=total_loss.item(), global_step=global_step)
+            logger.add_scalar(tag='total_loss', scalar_value=original_loss, global_step=global_step)
             logger.add_scalar(tag='loss_q', scalar_value=loss_q.item(), global_step=global_step)
             if mtl == 1:  # AIGCIQA2023 has aesthetic score
                 logger.add_scalar(tag='loss_a', scalar_value=loss_a.item(), global_step=global_step)
             if mtl in [0, 1]:  # AGIQA3K and AIGCIQA2023 have correspondence score
                 logger.add_scalar(tag='loss_c', scalar_value=loss_c.item(), global_step=global_step)
             global_step += 1
+        
+        # Memory optimization: periodic cache clearing
+        if idx % 50 == 0:
+            torch.cuda.empty_cache()
 
+    # Handle remaining gradients if batch count is not divisible by accumulation_steps
+    if len(train_loaders) % accumulation_steps != 0:
         convert_models_to_fp32(model)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
 
     # Validate on validation set
     val_out = eval(loader=val_loaders)
@@ -162,7 +196,7 @@ def train(model, best_result, best_epoch):
     else:  # AGIQA3K or AIGCIQA2023 - multiple scores
         val_srcc_avg = (val_srcc_q + val_srcc_a + val_srcc_c) / 3
         
-    print("VAL - srccc_avg: {:.3f}\tsrcc_q: {:.3f}\tsrcc_a: {:.3f}\tsrcc_c: {:.3f}\tloss: {:.3f}".format(val_srcc_avg, val_srcc_q, val_srcc_a, val_srcc_c, total_loss))
+    print("VAL - srccc_avg: {:.3f}\tsrcc_q: {:.3f}\tsrcc_a: {:.3f}\tsrcc_c: {:.3f}\tloss: {:.3f}".format(val_srcc_avg, val_srcc_q, val_srcc_a, val_srcc_c, last_total_loss))
 
     if not os.path.exists(os.path.join('checkpoints', dataset, 'MTD_IQA')):
         os.makedirs(os.path.join('checkpoints', dataset, 'MTD_IQA'))
@@ -220,15 +254,15 @@ def eval(loader):
             y_a.extend(mos_a.cpu().numpy())
             y_c.extend(mos_c.cpu().numpy())
 
-    _, PLCC1, SRCC1, KRCC1 = compute_metric(np.array(y_q), np.array(y_pred_q), istrain)
+    RMSE1, PLCC1, SRCC1, KRCC1 = compute_metric(np.array(y_q), np.array(y_pred_q), istrain)
     if mtl == 1:  # AIGCIQA2023 has aesthetic score
-        _, PLCC2, SRCC2, KRCC2 = compute_metric(np.array(y_a), np.array(y_pred_a), istrain)
+        RMSE2, PLCC2, SRCC2, KRCC2 = compute_metric(np.array(y_a), np.array(y_pred_a), istrain)
     else:
-        _, PLCC2, SRCC2, KRCC2 = 0.0, 0.0, 0.0, 0.0
+        RMSE2, PLCC2, SRCC2, KRCC2 = 0.0, 0.0, 0.0, 0.0
     if mtl in [0, 1]:  # AGIQA3K and AIGCIQA2023 have correspondence score
-        _, PLCC3, SRCC3, KRCC3 = compute_metric(np.array(y_c), np.array(y_pred_c), istrain)
+        RMSE3, PLCC3, SRCC3, KRCC3 = compute_metric(np.array(y_c), np.array(y_pred_c), istrain)
     else:
-        _, PLCC3, SRCC3, KRCC3 = 0.0, 0.0, 0.0, 0.0
+        RMSE3, PLCC3, SRCC3, KRCC3 = 0.0, 0.0, 0.0, 0.0
 
     out = [SRCC1, PLCC1, KRCC1,
            SRCC2, PLCC2, KRCC2,
@@ -315,15 +349,20 @@ def final_test_evaluation(model, test_loaders):
                 detailed_results.append(result_row)
 
     # Calculate overall metrics
-    _, PLCC1, SRCC1, KRCC1 = compute_metric(np.array(y_q), np.array(y_pred_q), istrain)
+    RMSE1, PLCC1, SRCC1, KRCC1 = compute_metric(np.array(y_q), np.array(y_pred_q), istrain)
+    MSE1 = RMSE1 ** 2  # Convert RMSE to MSE
+    
     if mtl == 1:  # AIGCIQA2023 has aesthetic score
-        _, PLCC2, SRCC2, KRCC2 = compute_metric(np.array(y_a), np.array(y_pred_a), istrain)
+        RMSE2, PLCC2, SRCC2, KRCC2 = compute_metric(np.array(y_a), np.array(y_pred_a), istrain)
+        MSE2 = RMSE2 ** 2
     else:
-        _, PLCC2, SRCC2, KRCC2 = 0.0, 0.0, 0.0, 0.0
+        RMSE2, PLCC2, SRCC2, KRCC2, MSE2 = 0.0, 0.0, 0.0, 0.0, 0.0
+        
     if mtl in [0, 1]:  # AGIQA3K and AIGCIQA2023 have correspondence score
-        _, PLCC3, SRCC3, KRCC3 = compute_metric(np.array(y_c), np.array(y_pred_c), istrain)
+        RMSE3, PLCC3, SRCC3, KRCC3 = compute_metric(np.array(y_c), np.array(y_pred_c), istrain)
+        MSE3 = RMSE3 ** 2
     else:
-        _, PLCC3, SRCC3, KRCC3 = 0.0, 0.0, 0.0, 0.0
+        RMSE3, PLCC3, SRCC3, KRCC3, MSE3 = 0.0, 0.0, 0.0, 0.0, 0.0
 
     test_out = [SRCC1, PLCC1, KRCC1,
                 SRCC2, PLCC2, KRCC2,
@@ -338,7 +377,45 @@ def final_test_evaluation(model, test_loaders):
     else:  # AGIQA3K or AIGCIQA2023 - multiple scores
         test_srcc_avg = (test_srcc_q + test_srcc_a + test_srcc_c) / 3
         
-    print("FINAL TEST - srccc_avg: {:.3f}\tsrcc_q: {:.3f}\tsrcc_a: {:.3f}\tsrcc_c: {:.3f}".format(test_srcc_avg, test_srcc_q, test_srcc_a, test_srcc_c))
+    # Comprehensive output for paper reporting
+    print("="*80)
+    print("FINAL TEST RESULTS - COMPREHENSIVE METRICS")
+    print("="*80)
+    print(f"Dataset: {dataset} | MTL mode: {mtl}")
+    print("-" * 80)
+    
+    # Quality metrics (always present)
+    print(f"QUALITY  - SRCC: {SRCC1:.4f} | PLCC: {PLCC1:.4f} | KRCC: {KRCC1:.4f} | MSE: {MSE1:.4f}")
+    
+    # Aesthetic metrics (AIGCIQA2023 only)
+    if mtl == 1:
+        print(f"AESTHETIC- SRCC: {SRCC2:.4f} | PLCC: {PLCC2:.4f} | KRCC: {KRCC2:.4f} | MSE: {MSE2:.4f}")
+    else:
+        print(f"AESTHETIC- SRCC: N/A     | PLCC: N/A     | KRCC: N/A     | MSE: N/A")
+    
+    # Correspondence/Alignment metrics (AGIQA3K and AIGCIQA2023)
+    if mtl in [0, 1]:
+        metric_name = "ALIGN    " if mtl == 0 else "CORRESP  "
+        print(f"{metric_name}- SRCC: {SRCC3:.4f} | PLCC: {PLCC3:.4f} | KRCC: {KRCC3:.4f} | MSE: {MSE3:.4f}")
+    else:
+        print(f"CORRESP  - SRCC: N/A     | PLCC: N/A     | KRCC: N/A     | MSE: N/A")
+        
+    print("-" * 80)
+    print(f"AVERAGE SRCC: {test_srcc_avg:.4f}")
+    print("="*80)
+    
+    # Also provide a compact format for easy copying to paper
+    print("\nCOMPACT FORMAT FOR PAPER:")
+    if mtl == 2:  # AIGCQA20K - single task
+        print(f"Quality: SRCC={SRCC1:.4f}, PLCC={PLCC1:.4f}, KRCC={KRCC1:.4f}, MSE={MSE1:.4f}")
+    elif mtl == 0:  # AGIQA3K - quality + alignment
+        print(f"Quality: SRCC={SRCC1:.4f}, PLCC={PLCC1:.4f}, KRCC={KRCC1:.4f}, MSE={MSE1:.4f}")
+        print(f"Alignment: SRCC={SRCC3:.4f}, PLCC={PLCC3:.4f}, KRCC={KRCC3:.4f}, MSE={MSE3:.4f}")
+    elif mtl == 1:  # AIGCIQA2023 - quality + aesthetic + correspondence
+        print(f"Quality: SRCC={SRCC1:.4f}, PLCC={PLCC1:.4f}, KRCC={KRCC1:.4f}, MSE={MSE1:.4f}")
+        print(f"Aesthetic: SRCC={SRCC2:.4f}, PLCC={PLCC2:.4f}, KRCC={KRCC2:.4f}, MSE={MSE2:.4f}")
+        print(f"Correspondence: SRCC={SRCC3:.4f}, PLCC={PLCC3:.4f}, KRCC={KRCC3:.4f}, MSE={MSE3:.4f}")
+    print()
     
     # Save detailed results to CSV
     results_df = pd.DataFrame(detailed_results)
@@ -397,6 +474,9 @@ test_loaders = set_dataset_csv(test_csv, bs, dataset_path, radius, num_workers, 
 initial_lr1 = 1e-3 if dataset == 'AIGCIQA2023' else 5e-4
 optimizer1 = torch.optim.AdamW(model.parameters(), lr=initial_lr1, weight_decay=weight_decay)
 optimizer2 = torch.optim.AdamW(model.parameters(), lr=initial_lr2, weight_decay=weight_decay)
+
+# Create gradient scaler for mixed precision training
+scaler = torch.cuda.amp.GradScaler()
 
 result_pkl = {}
 
