@@ -186,7 +186,7 @@ class ImageDatasetAGIQA(Dataset):
         I_s = self.preprocess[2](I)
         con_text_prompts = self.con_text_prompts[index]
         if self.dataset == 'AIGCQA-20k':
-            con_tokens = torch.cat([clip.tokenize(prompt, context_length=512) for prompt in con_text_prompts])
+            con_tokens = torch.cat([clip.tokenize(prompt, truncate=True) for prompt in con_text_prompts])
         else:
             con_tokens = torch.cat([clip.tokenize(prompt) for prompt in con_text_prompts])
         mos_q = self.mos1[index]

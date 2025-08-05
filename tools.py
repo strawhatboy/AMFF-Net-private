@@ -1,6 +1,6 @@
 from torch.utils.data import DataLoader
 from ImageDataset4 import ImageDataset4
-from torchvision.transforms import Compose, ToTensor, Normalize, RandomHorizontalFlip
+from torchvision.transforms import Compose, ToTensor, Normalize, RandomHorizontalFlip, Resize
 from torchvision import transforms
 from PIL import Image
 import numpy as np
@@ -8,6 +8,9 @@ import torch
 from scipy import stats
 from scipy.optimize import curve_fit
 from sklearn.metrics import mean_squared_error
+
+CONTEXT_LENGTH = 512
+
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -160,7 +163,8 @@ def _convert_image_to_rgb(image):
 def _preprocess2(size):
     return Compose([
         _convert_image_to_rgb,
-        AdaptiveResize(size),
+        # AdaptiveResize(size),
+        Resize((size, size)),
         ToTensor(),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
     ])
@@ -168,7 +172,8 @@ def _preprocess2(size):
 def _preprocess3(size):
     return Compose([
         _convert_image_to_rgb,
-        AdaptiveResize(size),
+        # AdaptiveResize(size),
+        Resize((size, size)),
         RandomHorizontalFlip(),
         ToTensor(),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
