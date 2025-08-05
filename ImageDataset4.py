@@ -164,9 +164,9 @@ class ImageDatasetAGIQA(Dataset):
             elif 'mos' in df.columns:
                 # AIGCQA-20k format: single mos column
                 mos_value = row['mos']
-                self.mos1.append(mos_value)  # Use single MOS for quality
-                self.mos2.append(0.0)  # No aesthetic score
-                self.mos3.append(0.0)  # No correspondence score
+                self.mos1.append(mos_value)  # Use single MOS for quality, and others
+                self.mos2.append(mos_value)  # No aesthetic score
+                self.mos3.append(mos_value)  # No correspondence score
                 self.dataset = 'AIGCQA-20k'
             else:
                 raise ValueError(f"Unsupported CSV format. Available columns: {df.columns.tolist()}")

@@ -428,7 +428,7 @@ def final_test_evaluation(model, test_loaders):
 num_workers = 8
 
 # Setup dataset configuration
-mtl_map = {'AGIQA3K': 0, 'AIGCIQA2023': 1, 'AIGCQA20K': 2}
+mtl_map = {'AGIQA3K': 0, 'AIGCIQA2023': 1, 'AIGCQA20K': 1}  # AIGCQA20K uses single MOS, but same MTL as AIGCIQA2023
 mtl = mtl_map[dataset]
 change_epoch = {'AGIQA3K': 60, 'AIGCIQA2023': 60, 'AIGCQA20K': 60}
 
